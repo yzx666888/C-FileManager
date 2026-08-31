@@ -88,6 +88,37 @@ bool ValidateDirectories(
     Language language,
     const DirectoryDiffOptions& options,
     std::string& error) {
+
+    /*
+    程序启动时，RunFileManager() 让用户选择语言：
+    const Language language = (!languageChoice.empty() && languageChoice.front() == '2')
+    ? Language::English
+    : Language::Chinese;
+
+    这个 language 会一路传入：
+    RunDirectoryDiff(language, options);
+
+    传给校验函数：
+    ValidateDirectories(language, options, validationError);
+
+    而 Tr() 的实现是：
+    const char* Tr(Language language, const char* chinese, const char* english) {
+        return language == Language::English ? english : chinese;
+    }
+
+    所以这段：
+    error = Tr(language,
+        "目录 A（旧版本）不是有效目录。",
+        "Directory A (old version) is not a valid directory.");
+
+    等价于：
+    if (language == Language::English) {
+        error = "Directory A (old version) is not a valid directory.";
+    } else {
+        error = "目录 A（旧版本）不是有效目录。";
+    }
+    用户在开始菜单输入 2 时显示英文；输入 1 或其他内容时默认显示中文。
+    */
     if (!IsDirectory(options.oldDirectory)) {
         error = Tr(language,
             "目录 A（旧版本）不是有效目录。",
@@ -130,14 +161,36 @@ bool ValidateDirectories(
  * 关键变量：category 是事件类型；relativePath 是相对 A/B 的路径；detail 保存可选失败详情。
  */
 void LogEntry(
-    std::ofstream& log,
-    const char* category,
-    const fs::path& relativePath,
-    const std::string& detail = {}) {
+    std::ofstream& log, //外部传入的日志文件流引用，函数不负责创建/关闭文件，只负责写内容
+    const char* category, //日志类别，比如 "INFO", "WARN", "ERROR"，会显示成 [INFO] ...
+    const fs::path& relativePath, //要记录的文件路径
+    const std::string& detail = {}) { //可选附加信息，默认是空字符串（detail 可省略）
     if (!log) {
         return;
     }
     log << '[' << category << "] " << PathToUtf8(relativePath);
+    /*这句是把多段内容连续写入同一个输出流 log，它并不是一次复杂计算，而是连续调用 operator<< 的链式写法：
+        log << '[' << category << "] " << PathToUtf8(relativePath);
+        等价于按顺序执行：
+        1. log << '['  写入字符 [
+        2. << category  写入分类字符串（如 "INFO"）
+        3. << "] "  写入 ]
+        4. << PathToUtf8(relativePath)  写入路径字符串
+        << 在这里是“输出流插入运算符”，每次返回 log 自身，所以可以一连串链式拼接。最终效果通常像：
+        [INFO] some/path/file.txt  
+        （[] 之间是 category 的内容，最后接上转换后的路径）
+
+    <<、>>运算符：
+    1.流操作符（I/O 重载）  
+    - 在 std::cout << x / std::cin >> x 中，表示：
+      - <<：把内容写进输出流（插入）
+      - >>：从输入流读入内容（提取）
+
+    2. <<、>> 也是位运算符（默认语义，同C语言）
+       - x << n：左移（x 的二进制整体左移 n 位）
+       - x >> n：右移（右移 n 位）
+    所以它叫做“位移运算符”，但在有 <</>> 被重载的类型上（如 ostream/istream），它们也代表“流插入/提取”。
+    */
     if (!detail.empty()) {
         log << ": " << detail;
     }
@@ -157,6 +210,36 @@ void LogEntry(
  * oldFile/outputFile 是 A 中对照文件和 C 中目标文件；shouldCopy/category 决定当前 B 文件的处理方式。
  */
 bool RunDirectoryDiff(Language language, const DirectoryDiffOptions& options) {
+    /*
+    RunDirectoryDiff函数是这个项目的核心差分同步逻辑，核心目标是：
+    - 比较两个目录（A=旧版、B=新版）中的文件；
+    - 只把“新增”或“二进制内容有变化”的文件，从 A->B 方向复制到输出目录 C；
+    - 统计并输出差异结果（新增/更新/删除/失败/占用空间）；
+    - 写入一份日志文件。
+
+    直观来说它是在做“`B - A` 的差分导出”。
+
+    流程分 4 段：
+    1. `ValidateDirectories` 检查 A/B/C 是否有效；`PrepareEmptyOutputDirectory` 确保 C 可用。失败就直接返回 `false`。
+    2. 打开日志文件 `directory_diff_results_<时间戳>.txt`，先写入本次任务的目录信息。
+    3. 枚举 B 里的每个普通文件，按相对路径去找 A 中对应文件：
+       - 找不到：标记为 `ADDED`，拷贝到 C；
+       - 找到但类型不同（比如 A 对应不是普通文件）：标记 `UPDATED TYPE`，拷贝到 C；
+       - 找到且是普通文件：做二进制比较 `CompareFilesBinary`  
+         - 相同（`Equal`）则不拷贝，仅计数为 `identical`；
+         - 不同则标记 `UPDATED` 并拷贝到 C。
+    4. 再枚举 A 里的每个文件，检查在 B 是否缺失：
+       - 如果 B 中不存在，计为 `REMOVED (NOT COPIED)`，只统计不拷贝（符合“只导出新增/更新”的设计）。
+    
+    最后输出统计（控制台 + 日志）并返回：
+    
+    - `true`：无失败（`stats.failed == 0`）
+    - `false`：出现扫描/比较/拷贝等任何失败
+    
+    关键点总结：  
+    这个函数本质上就是“以 B 为源、按二进制内容判断差异、把差异文件落盘到 C”的实现。  
+    
+    */
     std::string validationError;
     if (!ValidateDirectories(language, options, validationError)) {
         std::cout << Tr(language, "错误：", "Error: ") << validationError << '\n';
